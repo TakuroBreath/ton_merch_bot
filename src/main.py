@@ -1,27 +1,31 @@
-import sys
-import logging
 import asyncio
+import logging
+import sys
 import time
 from io import BytesIO
+import openpyxl
+
+import pandas as pd
+import pytonconnect.exceptions
 import qrcode
 from aiogram import Bot, Dispatcher
 from aiogram.filters import CommandStart, Command
-from aiogram.types import Message, CallbackQuery, BufferedInputFile, FSInputFile
-from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.context import FSMContext
-from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.state import State
 from aiogram.fsm.state import StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import Message, CallbackQuery, BufferedInputFile, FSInputFile
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 from pytonapi import Tonapi
 from pytonapi.utils import nano_to_amount
-from pytoniq_core import Address
 from pytonconnect import TonConnect
-import pytonconnect.exceptions
+from pytoniq_core import Address
+
 import config
-from messages import get_comment_message
+from check_nft import check_nft
 from connector import get_connector
 from db import *
-from check_nft import check_nft
+from messages import get_comment_message
 
 logger = logging.getLogger(__file__)
 
@@ -61,7 +65,7 @@ async def main_callback_handler(call: CallbackQuery):
             update_user_size(message.chat.id, size)
             await buy(message, size, connector)
         elif data[0] == 'pay':
-            await connect_wallet(message, data[1], connector)
+            await pay(message, data[1], connector)
 
 
 @dp.message(CommandStart())
@@ -182,11 +186,11 @@ async def buy(message: Message, size: str, connector: TonConnect):
     # Определение цены футболки и применения скидок
     base_amount = config.BASE_AMOUNT
     if nft == 1:
-        amount = base_amount - base_amount * 0.2
-        await message.answer(f"У вас есть NFT 1 коллекции. Стоимость футболки для вас: {amount} TON")
+        amount = round(base_amount - base_amount * 0.2, 5)
+        await message.answer(f"У вас есть NFT первой коллекции. Стоимость футболки для вас: {amount} TON")
     elif nft == 2:
-        amount = base_amount - base_amount * 0.1
-        await message.answer(f"У вас есть NFT 2 коллекции. Стоимость футболки для вас: {amount} TON")
+        amount = round(base_amount - base_amount * 0.1, 5)
+        await message.answer(f"У вас есть NFT второй коллекции. Стоимость футболки для вас: {amount} TON")
     else:
         amount = base_amount
         await message.answer(f"Для получения скидки купите NFT. Стоимость футболки для вас: {amount} TON")
@@ -210,8 +214,9 @@ async def buy(message: Message, size: str, connector: TonConnect):
         await message.answer(f"Футболки размера {size} закончились.")
 
 
-async def pay(message: Message, amount: float, connector: TonConnect):
+async def pay(message: Message, amount: str, connector: TonConnect):
     connected = await connector.restore_connection()
+    amount = float(amount)
     if not connected:
         mk_b = InlineKeyboardBuilder()
         mk_b.button(text='Подключить', callback_data='start')
@@ -276,12 +281,20 @@ async def process_address(message: Message, state: FSMContext):
 
     conn = sqlite3.connect('../database/users.db')
     cursor = conn.cursor()
-    cursor.execute('SELECT username, size FROM users WHERE telegram_id = ?', (telegram_id,))
+    cursor.execute('SELECT username FROM users WHERE telegram_id = ?', (telegram_id,))
     user = cursor.fetchone()
     conn.close()
 
     if user:
-        username, size = user
+        username = user[0]
+        conn = sqlite3.connect('../database/users.db')
+        cursor = conn.cursor()
+        cursor.execute('SELECT size FROM users WHERE telegram_id = ?', (telegram_id,))
+        size = cursor.fetchone()[0]
+        conn.close()
+
+        add_order(telegram_id, username, address, size)
+
         await message.answer(f'Ваш адрес: {address} был сохранен.')
         await bot.send_message(ADMIN_ID,
                                f"Пользователь @{username} оплатил заказ. Он заказал футболку с размером {size}. Его адрес: {address}")
@@ -290,6 +303,39 @@ async def process_address(message: Message, state: FSMContext):
 
     # Завершаем состояние
     await state.clear()
+
+
+
+@dp.message(Command(commands='export_db'))
+async def export_db(message: Message):
+    if str(message.from_user.id) != ADMIN_ID:
+        await message.answer('У вас нет прав для выполнения этой команды.')
+        return
+
+    conn_users = sqlite3.connect('../database/users.db')
+    df_users = pd.read_sql_query('SELECT * FROM users', conn_users)
+    conn_users.close()
+
+    conn_transactions = sqlite3.connect('../database/transactions.db')
+    df_transactions = pd.read_sql_query('SELECT * FROM transactions', conn_transactions)
+    conn_transactions.close()
+
+    conn_inventory = sqlite3.connect('../database/inventory.db')
+    df_inventory = pd.read_sql_query('SELECT * FROM inventory', conn_inventory)
+    conn_inventory.close()
+
+    conn_orders = sqlite3.connect('../database/orders.db')
+    df_orders = pd.read_sql_query('SELECT * FROM orders', conn_orders)
+    conn_orders.close()
+
+    with pd.ExcelWriter('databases_export.xlsx') as writer:
+        df_users.to_excel(writer, sheet_name='Users', index=False)
+        df_transactions.to_excel(writer, sheet_name='Transactions', index=False)
+        df_inventory.to_excel(writer, sheet_name='Inventory', index=False)
+        df_orders.to_excel(writer, sheet_name='Orders', index=False)
+
+    file = FSInputFile('databases_export.xlsx')
+    await bot.send_document(chat_id=message.chat.id, document=file)
 
 
 async def scan():
