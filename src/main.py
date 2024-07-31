@@ -34,6 +34,7 @@ ADMIN_ID = config.ADMIN_ID
 
 class Form(StatesGroup):
     waiting_for_address = State()
+    waiting_for_new_address = State()
 
 
 # Инициализация бота и диспетчера
@@ -243,14 +244,15 @@ async def pay(message: Message, amount: str, connector: TonConnect):
             transaction=transaction
         ), 300)
         await asyncio.gather(send_task, delete)
-    except asyncio.TimeoutError:
-        msg = await message.answer(text='Время для платежа вышло', reply_markup=mk_b.as_markup())
-        await asyncio.create_task(delete_message(msg, 120))
-    except pytonconnect.exceptions.UserRejectsError:
-        await message.answer(text='Вы отменили платеж', reply_markup=mk_b.as_markup())
-        await asyncio.create_task(delete_message(msg, 120))
+    # except asyncio.TimeoutError:
+    #     msg = await message.answer(text='Время для платежа вышло', reply_markup=mk_b.as_markup())
+    #     await asyncio.create_task(delete_message(msg, 120))
+    # except pytonconnect.exceptions.UserRejectsError:
+    #     await message.answer(text='Вы отменили платеж', reply_markup=mk_b.as_markup())
+    #     await asyncio.create_task(delete_message(msg, 120))
     except Exception as e:
-        await message.answer(text=f'Неизвестная ошибка: {e}, напишите @MaxSmurffy с текстом этой ошибки.')
+        pass
+        # await message.answer(text=f'Неизвестная ошибка: {e}, напишите @MaxSmurffy с текстом этой ошибки.')
 
 
 @dp.message(Command('address'))
@@ -267,7 +269,7 @@ async def address_command_handler(message: Message, state: FSMContext):
     if result and result[0] == 'paid':
         # Устанавливаем состояние ожидания адреса
         await state.set_state(Form.waiting_for_address)
-        await message.answer('Пожалуйста, введите ваш адрес для доставки. Вводите максимально подробную информацию.')
+        await message.answer(f"Пожалуйста, введите ваш адрес для доставки в следующем формате:\nФИО\nРегион\nГород\nУлица\nДом\nКвартира\nИндекс\nНомер телефона")
     else:
         await message.answer('Вы не оплатили заказ. Пожалуйста, сначала оплатите заказ.')
 
@@ -291,11 +293,15 @@ async def process_address(message: Message, state: FSMContext):
         cursor = conn.cursor()
         cursor.execute('SELECT size FROM users WHERE telegram_id = ?', (telegram_id,))
         size = cursor.fetchone()[0]
+        cursor.execute('''
+            UPDATE users SET payment_status = ? WHERE telegram_id = ?
+            ''', ('added', telegram_id))
+        conn.commit()
         conn.close()
 
         add_order(telegram_id, username, address, size)
 
-        await message.answer(f'Ваш адрес: {address} был сохранен.')
+        await message.answer(f"Ваш адрес: {address} был сохранен.\n\nЧтобы изменить адрес, введите /change_address")
         await bot.send_message(ADMIN_ID,
                                f"Пользователь @{username} оплатил заказ. Он заказал футболку с размером {size}. Его адрес: {address}")
     else:
@@ -304,6 +310,49 @@ async def process_address(message: Message, state: FSMContext):
     # Завершаем состояние
     await state.clear()
 
+
+@dp.message(Command(commands='change_address'))
+async def change_address(message: Message, state: FSMContext):
+    telegram_id = message.from_user.id
+
+    conn = sqlite3.connect('../database/orders.db')
+    cursor = conn.cursor()
+    cursor.execute('SELECT COUNT(*) FROM orders WHERE telegram_id = ?', (telegram_id,))
+    order_count = cursor.fetchone()[0]
+    conn.close()
+
+    if order_count > 0:
+        await state.set_state(Form.waiting_for_new_address)
+        await message.answer("Введите новый адрес для доставки:")
+    else:
+        await message.answer("У вас нет заказов. Вы не можете изменить адрес.")
+
+
+@dp.message(Form.waiting_for_new_address)
+async def process_new_address(message: Message, state: FSMContext):
+    new_address = message.text
+    telegram_id = message.from_user.id
+
+    update_user_address(telegram_id, new_address)
+    update_order_address(telegram_id, new_address)
+
+    await message.answer(f'Ваш новый адрес: {new_address} был сохранен.')
+
+    conn = sqlite3.connect('../database/users.db')
+    cursor = conn.cursor()
+    cursor.execute('SELECT username FROM users WHERE telegram_id = ?', (telegram_id,))
+    user = cursor.fetchone()
+    conn.close()
+
+    if user:
+        username = user[0]
+        await bot.send_message(ADMIN_ID,
+                               f"Пользователь @{username} изменил адрес на: {new_address}")
+    else:
+        await message.answer(f'Ваш новый адрес: {new_address} был сохранен, но произошла ошибка при отправке уведомления админу.')
+
+    # Завершаем состояние
+    await state.clear()
 
 
 @dp.message(Command(commands='export_db'))

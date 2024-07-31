@@ -79,6 +79,16 @@ def update_wallet_address(telegram_id, wallet_address):
     conn.commit()
     conn.close()
 
+def update_order_address(telegram_id, new_address):
+    conn = sqlite3.connect('../database/orders.db')
+    cursor = conn.cursor()
+    cursor.execute('''
+    UPDATE orders SET address = ? WHERE telegram_id = ?
+    ''', (new_address, telegram_id))
+    conn.commit()
+    conn.close()
+
+
 def add_transaction(hash, comment):
     conn = sqlite3.connect('../database/transactions.db')
     cursor = conn.cursor()
