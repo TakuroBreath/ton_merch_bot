@@ -2,132 +2,221 @@ import sys
 import logging
 import asyncio
 import time
-import sqlite3
 from io import BytesIO
 import qrcode
-
-import pytonconnect.exceptions
+from aiogram import Bot, Dispatcher
+from aiogram.filters import CommandStart, Command
+from aiogram.types import Message, CallbackQuery, BufferedInputFile, FSInputFile
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.fsm.state import State
+from aiogram.fsm.state import StatesGroup
+from pytonapi import Tonapi
+from pytonapi.utils import nano_to_amount
 from pytoniq_core import Address
 from pytonconnect import TonConnect
-
+import pytonconnect.exceptions
 import config
 from messages import get_comment_message
 from connector import get_connector
-
-from aiogram import Bot, Dispatcher, F
-from aiogram.enums import ParseMode
-from aiogram.filters import CommandStart, Command
-from aiogram.types import Message, CallbackQuery, BufferedInputFile
-from aiogram.utils.keyboard import InlineKeyboardBuilder
-
-from pytonapi import Tonapi
-from pytonapi.utils import nano_to_amount
+from db import *
+from check_nft import check_nft
 
 logger = logging.getLogger(__file__)
 
+ADMIN_ID = config.ADMIN_ID
+
+
+class Form(StatesGroup):
+    waiting_for_address = State()
+
+
+# Инициализация бота и диспетчера
+storage = MemoryStorage()
 dp = Dispatcher()
 bot = Bot(config.TOKEN)
 
-TON_API_KEY = 'AEGOUR3VZ55ERHAAAAAMTQ2R57ID43WZOBVAJLBOSMKRV52G26CT7PLHQG6NOOTU432NYVQ'
-tonapi = Tonapi(api_key=TON_API_KEY, is_testnet=config.IS_TESTNET)
-
-# Подключение к базе данных
-conn = sqlite3.connect('database.db')
-cursor = conn.cursor()
-
-# Создание таблицы
-cursor.execute('''
-CREATE TABLE IF NOT EXISTS users (
-    telegram_id INTEGER PRIMARY KEY,
-    username TEXT,
-    wallet_address TEXT,
-    payment_status TEXT,
-    amount_sent REAL,
-    address TEXT
-)
-''')
-conn.commit()
+tonapi = Tonapi(api_key=config.TON_API_KEY)
 
 
-# Функция для добавления пользователя в базу данных
-def add_user_to_db(telegram_id, username, wallet_address, payment_status='Pending', amount_sent=0.0, address=None):
-    cursor.execute('''
-    INSERT OR REPLACE INTO users (telegram_id, username, wallet_address, payment_status, amount_sent, address)
-    VALUES (?, ?, ?, ?, ?, ?)
-    ''', (telegram_id, username, wallet_address, payment_status, amount_sent, address))
-    conn.commit()
-
-
-# Функция для обновления статуса платежа и суммы
-def update_payment_status(telegram_id, payment_status, amount_sent):
-    cursor.execute('''
-    UPDATE users
-    SET payment_status = ?, amount_sent = ?
-    WHERE telegram_id = ?
-    ''', (payment_status, amount_sent, telegram_id))
-    conn.commit()
-
-
-# Функция для обновления адреса
-def update_address(telegram_id, address):
-    cursor.execute('''
-    UPDATE users
-    SET address = ?
-    WHERE telegram_id = ?
-    ''', (address, telegram_id))
-    conn.commit()
+@dp.callback_query(lambda call: True)
+async def main_callback_handler(call: CallbackQuery):
+    await call.answer()
+    message = call.message
+    connector = await connect(message)
+    data = call.data
+    if data == "start":
+        await command_start_handler(message, connector)
+    elif data == 'preview':
+        await preview(message)
+    elif data == 'disconnect':
+        await disconnect_wallet(message, connector)
+    else:
+        data = data.split(':')
+        if data[0] == 'connect':
+            await connect_wallet(message, data[1], connector)
+        elif data[0] == 'buy':
+            size = data[1]
+            update_user_size(message.chat.id, size)
+            await buy(message, size, connector)
+        elif data[0] == 'pay':
+            await connect_wallet(message, data[1], connector)
 
 
 @dp.message(CommandStart())
-async def command_start_handler(message: Message):
-    chat_id = message.chat.id
-    connector = get_connector(chat_id)
+async def command_start_handler(message: Message, connector: TonConnect = None):
+    if connector is None:
+        connector = get_connector(message.chat.id)
     connected = await connector.restore_connection()
+
+    telegram_id = message.from_user.id
+    username = message.from_user.username
+    add_user(telegram_id, username)
 
     mk_b = InlineKeyboardBuilder()
     if connected:
-        # mk_b.button(text='Send Transaction', callback_data='send_tr')
-        mk_b.button(text='Disconnect', callback_data='disconnect')
-        await message.answer(text='You are already connected!', reply_markup=mk_b.as_markup())
-
+        mk_b.button(text='Предпросмотр', callback_data='preview')
+        mk_b.button(text='Отключить кошелек', callback_data='disconnect')
+        await message.answer(text='Выберите действие:', reply_markup=mk_b.as_markup())
     else:
         wallets_list = TonConnect.get_wallets()
         for wallet in wallets_list:
             mk_b.button(text=wallet['name'], callback_data=f'connect:{wallet["name"]}')
         mk_b.adjust(1, )
-        await message.answer(text='Choose wallet to connect', reply_markup=mk_b.as_markup())
+        msg = await message.answer(text='Выберите кошелек для привязки', reply_markup=mk_b.as_markup())
+        await asyncio.create_task(delete_message(msg, 120))
 
 
-async def check_nft_and_send_transaction(message: Message, wallet_address: str):
-    account_id = Address(wallet_address).to_str(is_bounceable=True)
-    result = tonapi.accounts.get_nfts(account_id=account_id, limit=100)
+async def connect_wallet(message: Message, wallet_name: str, connector: TonConnect):
+    wallets_list = connector.get_wallets()
+    wallet = None
 
-    discount_1 = False
-    discount_2 = False
+    for w in wallets_list:
+        if w['name'] == wallet_name:
+            wallet = w
 
-    for nft in result.nft_items:
-        if nft.collection:
-            if nft.collection.address.to_userfriendly(
-                    is_bounceable=True) == "EQAzlVUwnQKBSJeyyP-733Xp44tnZDg_b_dzMqZEO-z58yeC":
-                discount_1 = True
-                break
-            if nft.collection.address.to_userfriendly(
-                    is_bounceable=True) == "EQCGYlzlIXsUs9lm3LdMcqHicSyl_5QDEn6QR3xdRcjW698K":
-                discount_2 = True
+    if wallet is None:
+        raise Exception(f'Неизвестный кошелек: {wallet_name}')
 
-    if discount_1:
-        amount = 5.6  # 20% скидка
-    elif discount_2:
-        amount = 6.3  # 10% скидка
-    else:
-        amount = 7.0  # без скидки
+    generated_url = await connector.connect(wallet)
 
-    connector = get_connector(message.chat.id)
+    mk_b = InlineKeyboardBuilder()
+    mk_b.button(text='Подключить', url=generated_url)
+
+    img = qrcode.make(generated_url)
+    stream = BytesIO()
+    img.save(stream)
+    file = BufferedInputFile(file=stream.getvalue(), filename='qrcode')
+
+    prev = await message.answer_photo(photo=file, caption='Подключите кошелек в течение 3-х минут',
+                                      reply_markup=mk_b.as_markup())
+
+    mk_b = InlineKeyboardBuilder()
+    mk_b.button(text='Начать', callback_data='start')
+
+    for i in range(1, 180):
+        await asyncio.sleep(1)
+        if connector.connected:
+            if connector.account.address:
+                wallet_address = connector.account.address
+                wallet_address = Address(wallet_address).to_str(is_bounceable=False)
+                update_wallet_address(message.chat.id, wallet_address)
+                await message.answer(f'Вы подключили кошелек: {wallet_address}', reply_markup=mk_b.as_markup())
+                await bot.delete_message(message.chat.id, prev.message_id)
+                logger.info(f'Подключенный кошелек: {wallet_address}')
+            return
+
+    await message.answer(f'Время для подключения вышло!', reply_markup=mk_b.as_markup())
+    await bot.delete_message(message.chat.id, prev.message_id)
+
+
+async def disconnect_wallet(message: Message, connector: TonConnect):
+    prev = await message.answer('Идет отвязка кошелька. Это может занять время...')
+    await connector.restore_connection()
+    try:
+        await connector.disconnect()
+        await bot.delete_message(message.chat.id, prev.message_id)
+    except Exception as e:
+        await message.answer('Вы отключили кошелек')
+        await bot.delete_message(message.chat.id, prev.message_id)
+
+
+@dp.message(Command(commands='preview'))
+async def preview(message: Message):
+    conn = sqlite3.connect('../database/inventory.db')
+    cursor = conn.cursor()
+    cursor.execute('SELECT * FROM inventory')
+    inventory = cursor.fetchall()
+    conn.close()
+
+    inventory_dict = {item[0]: item[1] for item in inventory}
+
+    mk_b = InlineKeyboardBuilder()
+    mk_b.button(text='Купить M', callback_data='buy:M')
+    mk_b.button(text='Купить L', callback_data='buy:L')
+
+    photo = FSInputFile("../media/merch.jpg")
+    m_count = inventory_dict.get('M', 0)
+    l_count = inventory_dict.get('L', 0)
+    caption = (f"Футболка oversize\n\n"
+               f"Доступно для покупки\n"
+               f"Размер М: {m_count} шт.\n"
+               f'Размер L: {l_count} шт.')
+
+    await message.answer_photo(photo=photo, caption=caption, reply_markup=mk_b.as_markup())
+
+
+async def buy(message: Message, size: str, connector: TonConnect):
     connected = await connector.restore_connection()
     if not connected:
-        await message.answer('Connect wallet first!')
+        mk_b = InlineKeyboardBuilder()
+        mk_b.button(text='Подключить', callback_data='start')
+        await message.answer('Подключите кошелек', reply_markup=mk_b.as_markup())
         return
 
+    address = connector.account.address
+    address = Address(address).to_str(is_bounceable=False)
+    nft = await asyncio.wait_for(check_nft(address), timeout=200)
+
+    # Определение цены футболки и применения скидок
+    base_amount = config.BASE_AMOUNT
+    if nft == 1:
+        amount = base_amount - base_amount * 0.2
+        await message.answer(f"У вас есть NFT 1 коллекции. Стоимость футболки для вас: {amount} TON")
+    elif nft == 2:
+        amount = base_amount - base_amount * 0.1
+        await message.answer(f"У вас есть NFT 2 коллекции. Стоимость футболки для вас: {amount} TON")
+    else:
+        amount = base_amount
+        await message.answer(f"Для получения скидки купите NFT. Стоимость футболки для вас: {amount} TON")
+
+    mk_b = InlineKeyboardBuilder()
+    mk_b.button(text='Оплатить', callback_data=f'pay:{amount}')
+
+    # Проверка наличия футболок в базе данных
+    conn = sqlite3.connect('../database/inventory.db')
+    cursor = conn.cursor()
+    cursor.execute('SELECT quantity FROM inventory WHERE size = ?', (size,))
+    quantity = cursor.fetchone()
+    conn.close()
+
+    if quantity and quantity[0] > 0:
+        # Если футболка есть в наличии, то уменьшаем количество
+        update_inventory(size, quantity[0] - 1)
+        await message.answer(f"Футболка размера {size} доступна. {quantity[0] - 1} шт. осталось.")
+        await message.answer("Подтвердите платеж в кошельке!", reply_markup=mk_b.as_markup())
+    else:
+        await message.answer(f"Футболки размера {size} закончились.")
+
+
+async def pay(message: Message, amount: float, connector: TonConnect):
+    connected = await connector.restore_connection()
+    if not connected:
+        mk_b = InlineKeyboardBuilder()
+        mk_b.button(text='Подключить', callback_data='start')
+        await message.answer('Подключите кошелек', reply_markup=mk_b.as_markup())
+        return
     transaction = {
         'valid_until': int(time.time() + 3600),
         'messages': [
@@ -139,104 +228,126 @@ async def check_nft_and_send_transaction(message: Message, wallet_address: str):
         ]
     }
 
-    # Добавление пользователя в базу данных
-    add_user_to_db(message.chat.id, message.from_user.username, wallet_address)
+    mk_b = InlineKeyboardBuilder()
+    mk_b.button(text='Повторить', callback_data='pay')
 
-    await message.answer(text='Approve transaction in your wallet app!')
+    msg = await message.answer(text='Подтвердите платеж в приложении кошелька!')
+    delete = asyncio.create_task(delete_message(msg, 120))
     try:
-        await asyncio.wait_for(connector.send_transaction(transaction=transaction), 300)
+        send_task = asyncio.wait_for(connector.send_transaction(
+            transaction=transaction
+        ), 300)
+        await asyncio.gather(send_task, delete)
     except asyncio.TimeoutError:
-        await message.answer(text='Timeout error!')
+        msg = await message.answer(text='Время для платежа вышло', reply_markup=mk_b.as_markup())
+        await asyncio.create_task(delete_message(msg, 120))
     except pytonconnect.exceptions.UserRejectsError:
-        await message.answer(text='You rejected the transaction!')
+        await message.answer(text='Вы отменили платеж', reply_markup=mk_b.as_markup())
+        await asyncio.create_task(delete_message(msg, 120))
     except Exception as e:
-        await message.answer(text=f'Unknown error: {e}')
+        await message.answer(text=f'Неизвестная ошибка: {e}, напишите @MaxSmurffy с текстом этой ошибки.')
 
 
-async def connect_wallet(message: Message, wallet_name: str):
-    connector = get_connector(message.chat.id)
+@dp.message(Command('address'))
+async def address_command_handler(message: Message, state: FSMContext):
+    telegram_id = message.from_user.id
 
-    wallets_list = connector.get_wallets()
-    wallet = None
+    # Проверка, что пользователь оплатил заказ
+    conn = sqlite3.connect('../database/users.db')
+    cursor = conn.cursor()
+    cursor.execute('SELECT payment_status FROM users WHERE telegram_id = ?', (telegram_id,))
+    result = cursor.fetchone()
+    conn.close()
 
-    for w in wallets_list:
-        if w['name'] == wallet_name:
-            wallet = w
-
-    if wallet is None:
-        raise Exception(f'Unknown wallet: {wallet_name}')
-    print("Url is coming")
-    generated_url = await connector.connect(wallet)
-
-    mk_b = InlineKeyboardBuilder()
-    mk_b.button(text='Connect', url=generated_url)
-
-    img = qrcode.make(generated_url)
-    stream = BytesIO()
-    img.save(stream)
-    file = BufferedInputFile(file=stream.getvalue(), filename='qrcode')
-
-    await message.answer_photo(photo=file, caption='Connect wallet within 3 minutes', reply_markup=mk_b.as_markup())
-
-    mk_b = InlineKeyboardBuilder()
-    mk_b.button(text='Start', callback_data='start')
-
-    for i in range(1, 180):
-        await asyncio.sleep(1)
-        if connector.connected:
-            if connector.account.address:
-                wallet_address = connector.account.address
-                wallet_address_str = Address(wallet_address).to_str(is_bounceable=False)
-                await message.answer(f'You are connected with address {wallet_address_str}',
-                                     reply_markup=mk_b.as_markup())
-                logger.info(f'Connected with address: {wallet_address_str}')
-                await check_nft_and_send_transaction(message, wallet_address_str)
-            return
-
-    await message.answer(f'Timeout error!', reply_markup=mk_b.as_markup())
-
-
-async def disconnect_wallet(message: Message):
-    connector = get_connector(message.chat.id)
-    await connector.restore_connection()
-    await connector.disconnect()
-    await message.answer('You have been successfully disconnected!')
-
-
-@dp.callback_query(lambda call: True)
-async def main_callback_handler(call: CallbackQuery):
-    await call.answer()
-    message = call.message
-    data = call.data
-    if data == "start":
-        await command_start_handler(message)
-    elif data == 'disconnect':
-        await disconnect_wallet(message)
+    if result and result[0] == 'paid':
+        # Устанавливаем состояние ожидания адреса
+        await state.set_state(Form.waiting_for_address)
+        await message.answer('Пожалуйста, введите ваш адрес для доставки. Вводите максимально подробную информацию.')
     else:
-        data = data.split(':')
-        if data[0] == 'connect':
-            await connect_wallet(message, data[1])
+        await message.answer('Вы не оплатили заказ. Пожалуйста, сначала оплатите заказ.')
 
 
-async def scan_wallet():
+@dp.message(Form.waiting_for_address)
+async def process_address(message: Message, state: FSMContext):
+    address = message.text
+    telegram_id = message.from_user.id
+
+    update_user_address(telegram_id, address)
+
+    conn = sqlite3.connect('../database/users.db')
+    cursor = conn.cursor()
+    cursor.execute('SELECT username, size FROM users WHERE telegram_id = ?', (telegram_id,))
+    user = cursor.fetchone()
+    conn.close()
+
+    if user:
+        username, size = user
+        await message.answer(f'Ваш адрес: {address} был сохранен.')
+        await bot.send_message(ADMIN_ID,
+                               f"Пользователь @{username} оплатил заказ. Он заказал футболку с размером {size}. Его адрес: {address}")
+    else:
+        await message.answer(f'Ваш адрес: {address} был сохранен, но произошла ошибка при отправке уведомления админу.')
+
+    # Завершаем состояние
+    await state.clear()
+
+
+async def scan():
     while True:
-        result = tonapi.blockchain.get_account_transactions(account_id=config.ACCOUNT_ID, limit=1000)
-        txs = result.transactions
-        for tx in txs:
-            if nano_to_amount(tx.in_msg.value) > 5:
-                if tx.in_msg.decoded_op_name == "text_comment":
-                    telegram_id = tx.in_msg.decoded_body['text'].replace("telegram_id: ", "")
-                    update_payment_status(telegram_id, 'Paid', nano_to_amount(tx.in_msg.value))
-                    await bot.send_message(telegram_id, "Платеж принят! Пожалуйста, отправьте ваш адрес.")
-        await asyncio.sleep(30)  # сканировать кошелек каждые 30 секунд
+        await asyncio.sleep(5)
+        try:
+            result = tonapi.blockchain.get_account_transactions(account_id=config.ACCOUNT_ID, limit=1000)
+            txs = result.transactions
+
+            for tx in txs:
+                tx_hash = tx.hash
+                comment = tx.in_msg.decoded_body['text']
+
+                # Проверка, есть ли уже такая транзакция в базе данных
+                conn = sqlite3.connect('../database/transactions.db')
+                cursor = conn.cursor()
+                cursor.execute('''
+                        SELECT * FROM transactions WHERE hash = ?
+                        ''', (tx_hash,))
+                existing_tx = cursor.fetchone()
+                conn.close()
+
+                if existing_tx:
+                    continue  # Если транзакция уже существует, пропустить
+
+                # Если транзакция новая, добавить ее в базу данных
+                add_transaction(tx_hash, comment)
+
+                if comment:
+                    # Если комментарий содержит telegram_id, то отправить сообщение и обновить флаг
+                    telegram_id = comment
+                    amount = nano_to_amount(tx.in_msg.value)
+                    update_user_payment_status(telegram_id, 'paid', amount)
+                    update_transaction_flag(tx_hash)
+                    await bot.send_message(chat_id=telegram_id,
+                                           text="Платеж принят! Пожалуйста, отправьте ваш адрес. Для этого используйте команду /address. Вводите максимально полный адрес.")
+
+        except Exception as e:
+            logger.error(f"Ошибка сканирования: {e}")
+
+
+async def delete_message(message: Message, sleep_time: int = 60):
+    await asyncio.sleep(sleep_time)
+    await message.delete()
+
+
+async def connect(message):
+    chat_id = message.chat.id
+    connector = get_connector(chat_id)
+    return connector
 
 
 async def main() -> None:
-    await bot.delete_webhook(drop_pending_updates=True)  # skip_updates = True
-    await dp.start_polling(bot)
-    await asyncio.create_task(scan_wallet())  # запуск сканера кошелька
+    await bot.delete_webhook(drop_pending_updates=True)
+    await asyncio.gather(dp.start_polling(bot), scan())
 
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, stream=sys.stdout)
+    create_databases()
     asyncio.run(main())
