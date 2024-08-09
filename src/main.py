@@ -6,7 +6,6 @@ from io import BytesIO
 import openpyxl
 
 import pandas as pd
-import pytonconnect.exceptions
 import qrcode
 from aiogram import Bot, Dispatcher
 from aiogram.filters import CommandStart, Command
@@ -269,7 +268,8 @@ async def address_command_handler(message: Message, state: FSMContext):
     if result and result[0] == 'paid':
         # Устанавливаем состояние ожидания адреса
         await state.set_state(Form.waiting_for_address)
-        await message.answer(f"Пожалуйста, введите ваш адрес для доставки в следующем формате:\nФИО\nРегион\nГород\nУлица\nДом\nКвартира\nИндекс\nНомер телефона")
+        await message.answer(f"Пожалуйста, введите ваш адрес для доставки в следующем "
+                             f"формате:\nФИО\nРегион\nГород\nУлица\nДом\nКвартира\nИндекс\nНомер телефона")
     else:
         await message.answer('Вы не оплатили заказ. Пожалуйста, сначала оплатите заказ.')
 
@@ -303,7 +303,8 @@ async def process_address(message: Message, state: FSMContext):
 
         await message.answer(f"Ваш адрес: {address} был сохранен.\n\nЧтобы изменить адрес, введите /change_address")
         await bot.send_message(ADMIN_ID,
-                               f"Пользователь @{username} оплатил заказ. Он заказал футболку с размером {size}. Его адрес: {address}")
+                               f"Пользователь @{username} оплатил заказ. Он заказал футболку с размером {size}. Его "
+                               f"адрес: {address}")
     else:
         await message.answer(f'Ваш адрес: {address} был сохранен, но произошла ошибка при отправке уведомления админу.')
 
