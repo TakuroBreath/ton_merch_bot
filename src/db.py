@@ -42,7 +42,7 @@ def create_databases():
     )
     ''')
     cursor.execute('''
-    INSERT OR IGNORE INTO inventory (size, quantity) VALUES ('M', 300), ('L', 300)
+    INSERT OR IGNORE INTO inventory (size, quantity) VALUES ('M', 0), ('L', 0)
     ''')
     conn.commit()
     conn.close()

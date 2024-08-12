@@ -1,0 +1,14 @@
+[Unit]
+Description=Merch Bot
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/bots/merch_bot
+ExecStart=/root/bots/banana_bot/venv/bin/python3 /root/bots/merch_bot/main.py
+RestartSec=5s
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

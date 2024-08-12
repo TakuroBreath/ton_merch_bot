@@ -13,7 +13,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State
 from aiogram.fsm.state import StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import Message, CallbackQuery, BufferedInputFile, FSInputFile
+from aiogram.types import Message, CallbackQuery, BufferedInputFile, FSInputFile, InputFile
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from pytonapi import Tonapi
 from pytonapi.utils import nano_to_amount
@@ -160,15 +160,15 @@ async def preview(message: Message):
     mk_b.button(text='Купить M', callback_data='buy:M')
     mk_b.button(text='Купить L', callback_data='buy:L')
 
-    photo = FSInputFile("../media/merch.jpg")
+    photo = FSInputFile("../media/merch.gif")
     m_count = inventory_dict.get('M', 0)
     l_count = inventory_dict.get('L', 0)
     caption = (f"Футболка oversize\n\n"
-               f"Доступно для покупки\n"
+               f"Было куплено:\n"
                f"Размер М: {m_count} шт.\n"
                f'Размер L: {l_count} шт.')
 
-    await message.answer_photo(photo=photo, caption=caption, reply_markup=mk_b.as_markup())
+    await bot.send_animation(chat_id=message.chat.id, animation=photo, caption=caption, reply_markup=mk_b.as_markup())
 
 
 async def buy(message: Message, size: str, connector: TonConnect):
@@ -208,7 +208,7 @@ async def buy(message: Message, size: str, connector: TonConnect):
     if quantity and quantity[0] > 0:
         # Если футболка есть в наличии, то уменьшаем количество
         update_inventory(size, quantity[0] - 1)
-        await message.answer(f"Футболка размера {size} доступна. {quantity[0] - 1} шт. осталось.")
+        await message.answer(f"Футболка размера {size} доступна. {quantity[0] + 1} шт. было куплено.")
         await message.answer("Подтвердите платеж в кошельке!", reply_markup=mk_b.as_markup())
     else:
         await message.answer(f"Футболки размера {size} закончились.")
